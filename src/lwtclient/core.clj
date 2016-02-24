@@ -59,7 +59,7 @@
             prepared-cas (alia/prepare session "UPDATE REGISTERS2 SET contents=? WHERE id=? IF contents=?")]
         (dotimes [n (:operation-count options)]
           (println n)
-          (let [f (rand-nth [:write :cas :read])
+          (let [f (rand-nth [:cas])
                 register (rand-int register-count)
                 op {:type :invoke :f f
                     :time (corrected-time)
@@ -73,9 +73,7 @@
                        (println [v v'])
                        (if (-> result first ak)
                          (println (assoc op :type :ok :value [v v'] :time (corrected-time)))
-                         (do
-                           (println (-> result first))
-                           (println (assoc op :type :fail :value (-> result first :value) :time (corrected-time))))))
+                         (println (assoc op :type :fail :value [v v'] :time (corrected-time)))))
                      (catch UnavailableException e
                        (println (assoc op :type :fail :time (corrected-time))))
                      (catch ReadTimeoutException e
