@@ -1,8 +1,8 @@
 (ns lwtclient.core
   (:require [clojure.tools.cli :refer [parse-opts]]
             [clojure.string :as str]
-            [qbits.alia :as alia]
-            [qbits.hayt :as h])
+            [clojure.java.io :as io]
+            [qbits.alia :as alia])
   (:import (com.datastax.driver.core.exceptions UnavailableException
                                                 WriteTimeoutException
                                                 ReadTimeoutException
@@ -25,6 +25,7 @@
     :default 5
     :parse-fn #(Integer/parseInt %)
     :validate [#(< -1 %) "Must be greater than or equal to 0"]]
+   ["-p" "--print-schema" "Schema to use for cluster under load"]
    ["-H" "--hosts HOSTS" "Hosts to contact"
     :default "localhost"
     :parse-fn #(str/split % #",")
@@ -78,7 +79,7 @@
       (Thread/sleep 1000)
       (assoc op :type :fail))))
 
-(defn read
+(defn rread
   [session pst op]
   (try
     (let [value (-> (alia/execute session pst {:values [(:register op)]
@@ -95,45 +96,52 @@
       (Thread/sleep 1000)
       (assoc op :type :fail))))
 
+(defn print-schema
+  "Prints schema for use"
+  []
+  (println (slurp (io/resource "lwtclient_schema.cql"))))
+
 (defn -main
   "Entry point for CLI app"
   [& args]
   (let [{:keys [options arguments errors summary]} (parse-opts args cli-options)]
     (cond
       (:help options) (println summary)
-      errors (do (println summary) (println errors) (System/exit 1)))
-    (try
-      (let [cluster (alia/cluster {:contact-points (:hosts options)})
-            session (alia/connect cluster)
-            _ (alia/execute session (h/use-keyspace "lwtclient"))
-            provided-time-base (:start-time options)
-            relative-time-base (linear-time-nanos)
-            corrected-time (fn [] (+ provided-time-base (- (linear-time-nanos) relative-time-base)))
-            upper-bound (:upper-bound options)
-            register-count (:registers options)
-            prepared-read (alia/prepare session
-                                        "SELECT * FROM registers WHERE ID = ?")
-            prepared-write (alia/prepare session
-                                         "UPDATE registers SET contents=? WHERE id=? IF EXISTS")
-            prepared-write-not-exists (alia/prepare session
-                                                    "INSERT INTO registers (id, contents) VALUES (?, ?) IF NOT EXISTS")
-            prepared-cas (alia/prepare session
-                                       "UPDATE registers SET contents=? WHERE id=? IF contents=?")]
-        (dotimes [n (:operation-count options)]
-          (let [f (rand-nth [:cas :write :read])
-                register (rand-int register-count)
-                op {:type :invoke :f f
-                    :time (corrected-time)
-                    :register register}]
-            (println op)
-            (println (assoc (case f
-                              :cas (cas session upper-bound prepared-cas op)
-                              :write (write session upper-bound prepared-write
-                                            prepared-write-not-exists op)
-                              :read (read session prepared-read op))
-                            :time (corrected-time)))))
-        (alia/shutdown session)
-        (alia/shutdown cluster))
-      (catch Exception e
-        (println e)
-        (System/exit 1)))))
+      (:print-schema options) (print-schema)
+      errors (do (println summary) (println errors) (System/exit 1))
+      :else
+      (try
+        (let [cluster (alia/cluster {:contact-points (:hosts options)})
+              session (alia/connect cluster)
+              _ (alia/execute session "USE lwtclient;")
+              provided-time-base (:start-time options)
+              relative-time-base (linear-time-nanos)
+              corrected-time (fn [] (+ provided-time-base (- (linear-time-nanos) relative-time-base)))
+              upper-bound (:upper-bound options)
+              register-count (:registers options)
+              prepared-read (alia/prepare session
+                                          "SELECT * FROM registers WHERE ID = ?")
+              prepared-write (alia/prepare session
+                                           "UPDATE registers SET contents=? WHERE id=? IF EXISTS")
+              prepared-write-not-exists (alia/prepare session
+                                                      "INSERT INTO registers (id, contents) VALUES (?, ?) IF NOT EXISTS")
+              prepared-cas (alia/prepare session
+                                         "UPDATE registers SET contents=? WHERE id=? IF contents=?")]
+          (dotimes [n (:operation-count options)]
+            (let [f (rand-nth [:cas :write :read])
+                  register (rand-int register-count)
+                  op {:type :invoke :f f
+                      :time (corrected-time)
+                      :register register}]
+              (println op)
+              (println (assoc (case f
+                                :cas (cas session upper-bound prepared-cas op)
+                                :write (write session upper-bound prepared-write
+                                              prepared-write-not-exists op)
+                                :read (rread session prepared-read op))
+                              :time (corrected-time)))))
+          (alia/shutdown session)
+          (alia/shutdown cluster))
+        (catch Exception e
+          (println e)
+          (System/exit 1))))))
