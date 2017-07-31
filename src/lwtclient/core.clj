@@ -10,7 +10,11 @@
   (:gen-class))
 
 (def cli-options
-  [["-r" "--registers COUNT" "Number of registers to use"
+  [["-r" "--register-start ID" "Starting register id"
+    :default 1
+    :parse-fn #(Integer/parseInt %)
+    :validate [#(< 0 %) "Must be greater than 0"]]
+   ["-t" "--thread-count COUNT" "Number of LWT threads to run concurrently"
     :default 1
     :parse-fn #(Integer/parseInt %)
     :validate [#(< 0 %) "Must be greater than 0"]]
@@ -101,6 +105,52 @@
   []
   (println (slurp (io/resource "lwtclient_schema.cql"))))
 
+(defn- lprintln
+  "Println that locks *out*"
+  [& args]
+  (locking *out*
+    (apply println args)))
+
+(defn do-lwt-writes
+  "Run LWT operations against a cluster"
+  [hosts time-base register upper-bound count]
+  (try
+    (let [cluster (alia/cluster {:contact-points hosts})
+          session (alia/connect cluster)
+          _ (alia/execute session "USE lwtclient;")
+          relative-time-base (linear-time-nanos)
+          corrected-time (fn [] (+ time-base (- (linear-time-nanos) relative-time-base)))
+          prepared-read (alia/prepare session
+                                      "SELECT * FROM registers WHERE ID = ?")
+          prepared-write (alia/prepare session
+                                       "UPDATE registers SET contents=? WHERE id=? IF EXISTS")
+          prepared-write-not-exists (alia/prepare session
+                                                  "INSERT INTO registers (id, contents) VALUES (?, ?) IF NOT EXISTS")
+          prepared-cas (alia/prepare session
+                                     "UPDATE registers SET contents=? WHERE id=? IF contents=?")
+          process (atom 0)]
+      (dotimes [n count]
+        (let [f (rand-nth [:cas :write :read])
+              op {:type :invoke :f f
+                  :time (corrected-time)
+                  :process @process
+                  :register register}
+              new-op (assoc (case f
+                              :cas (cas session upper-bound prepared-cas op)
+                              :write (write session upper-bound prepared-write
+                                            prepared-write-not-exists op)
+                              :read (rread session prepared-read op))
+                            :time (corrected-time))]
+          (when (= :info (:type new-op))
+            (swap! process inc))
+          (lprintln op)
+          (lprintln new-op)))
+      (alia/shutdown session)
+      (alia/shutdown cluster))
+    (catch Exception e
+      (println e)
+      (System/exit 1))))
+
 (defn -main
   "Entry point for CLI app"
   [& args]
@@ -110,38 +160,9 @@
       (:print-schema options) (print-schema)
       errors (do (println summary) (println errors) (System/exit 1))
       :else
-      (try
-        (let [cluster (alia/cluster {:contact-points (:hosts options)})
-              session (alia/connect cluster)
-              _ (alia/execute session "USE lwtclient;")
-              provided-time-base (:start-time options)
-              relative-time-base (linear-time-nanos)
-              corrected-time (fn [] (+ provided-time-base (- (linear-time-nanos) relative-time-base)))
-              upper-bound (:upper-bound options)
-              register-count (:registers options)
-              prepared-read (alia/prepare session
-                                          "SELECT * FROM registers WHERE ID = ?")
-              prepared-write (alia/prepare session
-                                           "UPDATE registers SET contents=? WHERE id=? IF EXISTS")
-              prepared-write-not-exists (alia/prepare session
-                                                      "INSERT INTO registers (id, contents) VALUES (?, ?) IF NOT EXISTS")
-              prepared-cas (alia/prepare session
-                                         "UPDATE registers SET contents=? WHERE id=? IF contents=?")]
-          (dotimes [n (:operation-count options)]
-            (let [f (rand-nth [:cas :write :read])
-                  register (rand-int register-count)
-                  op {:type :invoke :f f
-                      :time (corrected-time)
-                      :register register}]
-              (println op)
-              (println (assoc (case f
-                                :cas (cas session upper-bound prepared-cas op)
-                                :write (write session upper-bound prepared-write
-                                              prepared-write-not-exists op)
-                                :read (rread session prepared-read op))
-                              :time (corrected-time)))))
-          (alia/shutdown session)
-          (alia/shutdown cluster))
-        (catch Exception e
-          (println e)
-          (System/exit 1))))))
+      (let [{:keys [hosts start-time upper-bound register-start
+                    operation-count thread-count]} options
+            count (quot operation-count thread-count)]
+        (doseq [n (range register-start (inc (+ register-start thread-count)))]
+          (future (do-lwt-writes hosts start-time (int n) upper-bound count)))
+        (shutdown-agents)))))
